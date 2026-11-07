@@ -33,9 +33,7 @@ class Model:
         self.history = HandHistory()
         self.opponents = OpponentModel()  # persists for the whole event
         self.strengths = StrengthCache()  # per hand
-        self.params = Params()
-        for name, value in GENES.items():
-            setattr(self.params, name, value)
+        self.params = Params(**GENES)
         self.policy = PolicyNet.zero_output()
         if WEIGHTS is not None:
             self.policy.weights = list(WEIGHTS)
