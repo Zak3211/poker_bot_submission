@@ -7,7 +7,14 @@ from game_state import GameStateView
 from hand_history import HandHistory
 from opponents import OpponentModel
 from player_action import PlayerAction
+from policy_net import PolicyNet
 from strength import StrengthCache
+
+
+try:  # evolved by scripts/evolve.py --export; absent until then
+    from policy_weights import GENES, WEIGHTS
+except ImportError:
+    GENES, WEIGHTS = {}, None
 
 
 class Model:
@@ -27,6 +34,11 @@ class Model:
         self.opponents = OpponentModel()  # persists for the whole event
         self.strengths = StrengthCache()  # per hand
         self.params = Params()
+        for name, value in GENES.items():
+            setattr(self.params, name, value)
+        self.policy = PolicyNet.zero_output()
+        if WEIGHTS is not None:
+            self.policy.weights = list(WEIGHTS)
         self.rng = random.Random(0)
         self.hands_played = 0
         # Hands left in the event, ours included: set before pickling. It
@@ -54,7 +66,8 @@ class Model:
             self.history.observe(actions, game_state)
             return choose(game_state, self.player_id, self.history,
                           self.opponents, self.strengths, self.params,
-                          self.rng, self.future_value(game_state))
+                          self.rng, self.future_value(game_state),
+                          self.policy)
         except Exception:
             if self.debug:
                 raise

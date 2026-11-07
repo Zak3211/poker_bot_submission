@@ -11,3 +11,6 @@ site_out/
 /site-src/
 /tests/site_js/
 /event.json
+
+# Neuroevolution state (scripts/evolve.py)
+/evolution/

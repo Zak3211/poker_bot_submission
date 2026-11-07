@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 from cards import hand_class
 from equity import equity_vector, range_equity
 from hand_history import HandHistory
-from opponents import OpponentModel, Situation
+from opponents import FOLD, SMALL, OpponentModel, Situation
 from player_action import PlayerAction
+from policy_net import PolicyNet, context_features, option_features
 from strength import StrengthCache
 from tables import CALL, MAX_BB, PUSH
 
@@ -55,6 +56,9 @@ class Option:
     fold_p: float = 0.0  # raises: the chance the opponent folds
     # (chance, change to our stack from now) for each way the hand ends
     outcomes: list[tuple[float, float]] = field(default_factory=list)
+    equity: float = 0.0  # against the range it plays against
+    size: float = 0.0  # chips it adds, over the pot
+    all_in: bool = False
 
 
 def survival(outcomes: list[tuple[float, float]], stack: int, value: float,
@@ -142,9 +146,11 @@ def evaluate_options(
     options = [Option(PlayerAction.call(me),
                       realised(opp_all_in or owe >= my_stack)
                       * p_win * (pot + owe) - owe,
-                      outcomes=[(p_win, pot), (1 - p_win, -owe)])]
+                      outcomes=[(p_win, pot), (1 - p_win, -owe)],
+                      equity=p_win, size=owe / pot, all_in=owe >= my_stack)]
     if owe > 0:
-        options.append(Option(PlayerAction.fold(me), 0.0, outcomes=[(1.0, 0)]))
+        options.append(Option(PlayerAction.fold(me), 0.0, outcomes=[(1.0, 0)],
+                              equity=p_win))
 
     buckets = strengths.buckets(board)
     opp_raised = any(r.player == opp and r.kind == "raise"
@@ -176,31 +182,45 @@ def evaluate_options(
                 outcomes.append((resp.raise_, -added))
         ev = resp.fold * pot + resp.call * called + resp.raise_ * reraised
         options.append(Option(PlayerAction.raise_to(me, total), ev, resp.fold,
-                              outcomes))
+                              outcomes, equity=p_called, size=added / pot,
+                              all_in=added >= my_stack))
     return options
 
 
 def choose(
     state, me: int, history: HandHistory, opponents: OpponentModel,
     strengths: StrengthCache, params: Params, rng: random.Random,
-    future_value: float = 0.0,
+    future_value: float = 0.0, policy: PolicyNet | None = None,
 ) -> PlayerAction:
     """
     The move to make: the option with the most expected chips plus
-    survival value. Preflop, while trust in the opponent model is low, the
-    push/fold equilibrium's move instead, unless survival makes it worse
-    than the best fold or check.
+    survival value, plus the policy network's adjustment (in pots) when
+    there is one. Preflop, while trust in the opponent model is low, the
+    push/fold equilibrium's move instead, unless that scores worse than
+    the best fold or check.
     """
     options = evaluate_options(state, me, history, opponents, strengths,
                                params, rng)
     scale = params.survival_scale_bb * state.big_blind
     stack = state.stacks[me]
+    pot = max(1, state.pot)
+    team = history.teams[1 - me]
+    use_net = policy is not None and not policy.is_zero()
+    if use_net:
+        facing = Situation(state.street, "medium", False)
+        style = opponents.style(team, facing)
+        context = context_features(state, me, opponents.team_trust(team),
+                                   style[FOLD], sum(style[SMALL:]) / 4)
 
     def score(o: Option) -> float:
-        return o.ev + survival(o.outcomes, stack, future_value, scale)
+        surv = survival(o.outcomes, stack, future_value, scale)
+        total = o.ev + surv
+        if use_net:
+            total += pot * policy.forward(
+                context + option_features(o, pot, surv))
+        return total
 
     best = max(options, key=score)
-    team = history.teams[1 - me]
     if state.street == "preflop" and rng.random() >= opponents.team_trust(team):
         nash = push_fold(state, me, history.hand, rng)
         match = [o for o in options if o.action == nash]
