@@ -7,6 +7,7 @@ import pytest
 
 from card_utils import full_deck
 from engine import play_hand
+from decision import push_fold
 from model import Model
 
 from arena.dummies import (CallBot, EquityBot, FoldBot, RandomBot, ShoveBot,
@@ -27,9 +28,15 @@ def test_plays_legally(opponent, stacks):
         assert 0 not in result.faults
 
 
-def test_small_blind_never_limps():
-    me = Model()
-    me.debug = True
+class PushFolder(Model):
+    def run(self, actions, game_state):
+        self.history.observe(actions, game_state)
+        return push_fold(game_state, self.player_id, self.history.hand,
+                         self.rng)
+
+
+def test_push_fold_never_limps():
+    me = PushFolder()
     for seed in range(40):
         deck = full_deck()
         random.Random(seed).shuffle(deck)
