@@ -1,0 +1,175 @@
+"""
+Builds tables.py (not part of the submission):
+
+- EQ169[i][j]: equity of class i against class j, all-in preflop, by Monte
+  Carlo; EQ169[i][j] + EQ169[j][i] == 1.
+- PAIRS[i][j]: how many combos of class j fit with one combo of class i
+  (card removal), averaged over i's combos.
+- PUSH[e][i], CALL[e][i]: heads-up push/fold equilibrium at an effective
+  stack of e big blinds (blinds included): how often the small blind
+  (button) shoves class i, and the big blind calls a shove with it. Solved
+  by fictitious play on EQ169 and PAIRS.
+
+    .venv/bin/python scripts/build_tables.py [--samples 4000] [--iters 2000]
+"""
+
+import argparse
+import os
+import random
+import sys
+from multiprocessing import Pool
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from cards import (CLASS_OF, COMBOS, COMBOS_OF_CLASS, NUM_CLASSES,  # noqa: E402
+                   class_name, rank7)
+
+MAX_BB = 30
+
+
+def _equity_row(job):
+    """Equity of class i against every class j >= i."""
+    i, samples = job
+    rng = random.Random(i)
+    row = {}
+    for j in range(i, NUM_CLASSES):
+        won = 0.0
+        n = 0
+        while n < samples:
+            a = COMBOS[rng.choice(COMBOS_OF_CLASS[i])]
+            b = COMBOS[rng.choice(COMBOS_OF_CLASS[j])]
+            if len({*a, *b}) < 4:
+                continue
+            used = {*a, *b}
+            rest = [c for c in range(52) if c not in used]
+            board = rng.sample(rest, 5)
+            ra, rb = rank7([*a, *board]), rank7([*b, *board])
+            won += 1.0 if ra > rb else 0.5 if ra == rb else 0.0
+            n += 1
+        row[j] = won / samples
+    return i, row
+
+
+def _pairs() -> list[list[float]]:
+    pairs = [[0.0] * NUM_CLASSES for _ in range(NUM_CLASSES)]
+    for a, (x, y) in enumerate(COMBOS):
+        ca = CLASS_OF[a]
+        for b, (u, v) in enumerate(COMBOS):
+            if u != x and u != y and v != x and v != y:
+                pairs[ca][CLASS_OF[b]] += 1
+    for i in range(NUM_CLASSES):
+        size = len(COMBOS_OF_CLASS[i])
+        pairs[i] = [n / size for n in pairs[i]]
+    return pairs
+
+
+def _solve(job):
+    """Push/fold equilibrium at e big blinds by fictitious play: each side
+    best-responds to the other's average strategy."""
+    e, eq, pairs, iters = job
+    n = NUM_CLASSES
+    weight = [len(COMBOS_OF_CLASS[i]) for i in range(n)]
+    # Small blind's net (in bb) when its shove with i is called by j, and
+    # the big blind's gain from calling with j over folding, against i.
+    sb_called = [[eq[i][j] * 2 * e - e for j in range(n)] for i in range(n)]
+    bb_gain = [[(1 - eq[i][j]) * 2 * e - e + 1 for j in range(n)]
+               for i in range(n)]
+    push = [1.0] * n
+    call = [0.5] * n
+    for t in range(1, iters + 1):
+        push_br = []
+        for i in range(n):
+            pi = pairs[i]
+            total = sum(pi)
+            ev = sum(pi[j] * (call[j] * sb_called[i][j] + (1 - call[j]))
+                     for j in range(n)) / total
+            push_br.append(1.0 if ev > -0.5 else 0.0)
+        call_br = []
+        for j in range(n):
+            gain = sum(pairs[j][i] * push[i] * bb_gain[i][j] for i in range(n))
+            call_br.append(1.0 if gain > 0 else 0.0)
+        step = 1.0 / (t + 1)
+        push = [p + step * (b - p) for p, b in zip(push, push_br)]
+        call = [c + step * (b - c) for c, b in zip(call, call_br)]
+    pushed = sum(w * p for w, p in zip(weight, push)) / 1326
+    called = sum(w * c for w, c in zip(weight, call)) / 1326
+    return e, push, call, pushed, called
+
+
+def _fmt(rows, digits):
+    out = []
+    for row in rows:
+        out.append("    [")
+        for start in range(0, len(row), 13):
+            chunk = ", ".join(f"{x:.{digits}f}" for x in row[start:start + 13])
+            out.append(f"        {chunk},")
+        out.append("    ],")
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples", type=int, default=4000)
+    parser.add_argument("--iters", type=int, default=2000)
+    args = parser.parse_args()
+
+    eq = [[0.5] * NUM_CLASSES for _ in range(NUM_CLASSES)]
+    with Pool() as pool:
+        jobs = [(i, args.samples) for i in range(NUM_CLASSES)]
+        for i, row in pool.imap_unordered(_equity_row, jobs):
+            for j, v in row.items():
+                if i == j:
+                    eq[i][i] = 0.5  # symmetric: exactly a coin flip
+                else:
+                    eq[i][j], eq[j][i] = v, 1 - v
+        print("equities done")
+        pairs = _pairs()
+        jobs = [(e, eq, pairs, args.iters) for e in range(1, MAX_BB + 1)]
+        solved = sorted(pool.map(_solve, jobs))
+
+    push = [[0.0] * NUM_CLASSES] + [s[1] for s in solved]
+    call = [[0.0] * NUM_CLASSES] + [s[2] for s in solved]
+    for e, _, _, pushed, called in solved:
+        print(f"{e:2d}bb: push {pushed:5.1%}  call {called:5.1%}")
+
+    lines = [
+        '"""',
+        "Generated by scripts/build_tables.py: do not edit by hand.",
+        "",
+        "Classes are numbered by cards.hand_class. EQ169[i][j]: all-in",
+        "preflop equity of class i against class j. PAIRS[i][j]: combos of",
+        "class j that fit with one combo of class i. PUSH[e][i], CALL[e][i]:",
+        "heads-up push/fold equilibrium at e big blinds effective (row 0 is",
+        f"unused): shove and call frequencies. {args.samples} samples per",
+        f"equity, {args.iters} fictitious-play iterations.",
+        '"""',
+        "",
+        f"MAX_BB = {MAX_BB}",
+        "",
+        "EQ169 = [",
+        *_fmt(eq, 4),
+        "]",
+        "",
+        "PAIRS = [",
+        *_fmt(pairs, 2),
+        "]",
+        "",
+        "PUSH = [",
+        *_fmt(push, 3),
+        "]",
+        "",
+        "CALL = [",
+        *_fmt(call, 3),
+        "]",
+    ]
+    with open(os.path.join(ROOT, "tables.py"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("AA vs KK", eq[12 * 13 + 12][11 * 13 + 11],
+          "| AKs vs 22", eq[12 * 13 + 11][0])
+    print("10bb push range:", " ".join(
+        class_name(c) for c in range(NUM_CLASSES) if push[10][c] > 0.5)[:300])
+
+
+if __name__ == "__main__":
+    main()
